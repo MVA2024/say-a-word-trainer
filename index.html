@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#fff9ec">
+  <link rel="preconnect" href="https://api.mymemory.translated.net" crossorigin>
   <link rel="manifest" href="./manifest.webmanifest">
   <title>Скажи слово - тренажёр английского</title>
   <style>
@@ -285,7 +286,7 @@
       start.innerHTML = listening
         ? '<span aria-hidden="true">■</span> Стоп'
         : '<span aria-hidden="true">🎤</span> Старт'
-      translate.disabled = !transcript || Boolean(recording || request) || Boolean(translation)
+      translate.disabled = !transcript || Boolean(request || translation)
       replay.hidden = !translation || !canSpeak
     }
 
@@ -355,6 +356,7 @@
         listening = false
         setStatus(transcript ? 'Вспомните значение, затем нажмите «Перевод»' : 'Слово не распознано. Попробуйте ещё раз', !transcript)
         update()
+        if (transcript && !request && !translation) translate.disabled = false
       }
       recognition.onerror = ({ error }) => {
         if (recording !== recognition) return
@@ -389,13 +391,13 @@
       }
     })
 
-    function readTranslation(data, word, target) {
+    function readTranslation(data, word, target, exactOnly = false) {
       const expectedScript = target === 'ru' ? /\p{Script=Cyrillic}/u : /\p{Script=Latin}/u
       const normalize = (text) => text.trim().toLowerCase().replace(/[.!?]+$/, '')
       const usable = (text) => typeof text === 'string' && expectedScript.test(text) &&
         normalize(text) !== normalize(word)
       const primary = data.responseData?.translatedText
-      if (usable(primary)) return primary.trim()
+      if (!exactOnly && usable(primary)) return primary.trim()
 
       // MyMemory sometimes ranks an untranslated match above a valid translation.
       const exact = Array.isArray(data.matches) ? data.matches.filter((item) =>
@@ -408,8 +410,30 @@
       return (sameLength || exact[0])?.translation.trim() || ''
     }
 
+    async function findMemoryTranslation(url, word, target, signal) {
+      const lookup = new URL(url)
+      lookup.searchParams.set('mt', '0')
+      const controller = new AbortController()
+      const abort = () => controller.abort()
+      signal.addEventListener('abort', abort, { once: true })
+      const timeout = setTimeout(abort, 1500)
+      try {
+        const response = await fetch(lookup, { signal: controller.signal })
+        if (!response.ok) return ''
+        const data = await response.json()
+        return !data.quotaFinished && Number(data.responseStatus) === 200
+          ? readTranslation(data, word, target, true)
+          : ''
+      } catch {
+        return ''
+      } finally {
+        clearTimeout(timeout)
+        signal.removeEventListener('abort', abort)
+      }
+    }
+
     translate.addEventListener('click', async () => {
-      if (!transcript || recording || request || translation) return
+      if (!transcript || request || translation) return
       if (new TextEncoder().encode(transcript).length > 500) {
         setStatus('Фраза слишком длинная. Нажмите «Старт» и скажите одно слово или короткую фразу', true)
         return
@@ -435,21 +459,28 @@
       url.search = new URLSearchParams({ q: word, langpair: `${language}|${target}` })
 
       try {
-        const response = await fetch(url, { signal: controller.signal })
-        if (request !== controller) return
-        if (response.status === 429) {
-          setStatus('Достигнут лимит MyMemory. Попробуйте позже', true)
-          return
+        let result = history.find((entry) => entry.source === language && entry.word === word)?.translation || ''
+        if (!result && language === 'ru') {
+          result = await findMemoryTranslation(url, word, target, controller.signal)
+          if (request !== controller) return
         }
-        if (!response.ok) throw new Error('HTTP ' + response.status)
-        const data = await response.json()
-        if (request !== controller) return
-        if (data.quotaFinished || Number(data.responseStatus) === 429) {
-          setStatus('Достигнут лимит MyMemory. Попробуйте позже', true)
-          return
+        if (!result) {
+          const response = await fetch(url, { signal: controller.signal })
+          if (request !== controller) return
+          if (response.status === 429) {
+            setStatus('Достигнут лимит MyMemory. Попробуйте позже', true)
+            return
+          }
+          if (!response.ok) throw new Error('HTTP ' + response.status)
+          const data = await response.json()
+          if (request !== controller) return
+          if (data.quotaFinished || Number(data.responseStatus) === 429) {
+            setStatus('Достигнут лимит MyMemory. Попробуйте позже', true)
+            return
+          }
+          if (Number(data.responseStatus) !== 200) throw new Error('MyMemory response')
+          result = readTranslation(data, word, target)
         }
-        if (Number(data.responseStatus) !== 200) throw new Error('MyMemory response')
-        const result = readTranslation(data, word, target)
         if (!result) {
           setStatus('Сервис не вернул перевод на нужном языке. Попробуйте сказать слово в короткой фразе', true)
           return
